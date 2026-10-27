@@ -11,6 +11,7 @@
 
 #include "megamoe_device.cuh"
 #include "megamoe_kernel.hpp"
+#include "megamoe_net.hpp"
 #include "megamoe_quantization.cuh"
 
 namespace MSCCLPP_MEGAMOE_KERNEL_NAMESPACE {
@@ -182,7 +183,7 @@ W4ScaleLayout<Types> makeW4ScaleLayout(int m, int n, int k, int experts, bool ac
 }
 
 W4A8Parameters makeParameters(const NativeConfig& c, void* symmetric, const uint64_t* peers, void* workspace,
-                              const PackedWeights& weights) {
+                              const PackedWeights& weights, const NetPlan* net) {
   using namespace cute;
   using P = W4A8Parameters;
   using Mainloop = typename P::Collective::Mainloop;
@@ -191,6 +192,7 @@ W4A8Parameters makeParameters(const NativeConfig& c, void* symmetric, const uint
   p.symmetric = getSymmetricLayout(c);
   p.local = symmetric;
   p.peers = peers;
+  p.net = makeNetDevice(c, net ? *net : NetPlan{});
   p.fc1TaskDivisor = cutlass::FastDivmod(2 * c.intermediate / P::Tiles::M);
   p.fc2TaskDivisor = cutlass::FastDivmod((c.hidden + P::Tiles::M - 1) / P::Tiles::M);
   size_t bytes;
@@ -254,8 +256,15 @@ struct KernelPlan {
 };
 
 void validateNativeConfig(const NativeConfig& c) {
-  if (c.worldSize < 1 || c.worldSize > 72 || c.rank < 0 || c.rank >= c.worldSize)
-    throw std::invalid_argument("MegaMoE requires 1 <= worldSize <= 72 and rank in [0, worldSize)");
+  // Per-peer loops assign one kernel thread per rank.
+  static_assert(MaxWorldSize <= detail::W4Threads);
+  if (c.worldSize < 1 || c.worldSize > MaxWorldSize || c.rank < 0 || c.rank >= c.worldSize)
+    throw std::invalid_argument("MegaMoE requires 1 <= worldSize <= " + std::to_string(MaxWorldSize) +
+                                " and rank in [0, worldSize)");
+  if (c.ranksPerRack < 0 || c.ranksPerRack > MaxRackSize ||
+      (c.ranksPerRack && (c.ranksPerRack > c.worldSize || c.worldSize % c.ranksPerRack)))
+    throw std::invalid_argument("MegaMoE ranksPerRack must be 0 (detect) or in [1, " + std::to_string(MaxRackSize) +
+                                "] and divide worldSize");
   if (c.maxTokens < 1 || c.hidden < 4096 || c.intermediate < 128 || c.hidden % 128 || c.intermediate % 128)
     throw std::invalid_argument("MegaMoE W4A8 requires positive capacity, hidden >= 4096, and H/I divisible by 128");
   if (c.hidden > std::numeric_limits<int>::max() / 2 || c.intermediate > std::numeric_limits<int>::max() / 2)
@@ -365,12 +374,12 @@ KernelResources preflightKernel(const NativeConfig& c) {
 }
 
 std::shared_ptr<KernelPlan> createKernelPlan(const NativeConfig& c, void* symmetric, const uint64_t* peers,
-                                             void* workspace, const PackedWeights& weights) {
+                                             void* workspace, const PackedWeights& weights, const NetPlan* net) {
   if (!symmetric || !peers || !workspace || !weights.fc1 || !weights.fc1Scale || !weights.fc2 || !weights.fc2Scale)
     throw std::invalid_argument("MegaMoE plan requires live workspaces, peer addresses, and packed weights");
   const auto resources = preflightKernel(c);
   auto plan = std::make_shared<KernelPlan>();
-  plan->params = detail::makeParameters(c, symmetric, peers, workspace, weights);
+  plan->params = detail::makeParameters(c, symmetric, peers, workspace, weights, net);
   plan->device = resources.device;
   plan->ctas = resources.ctas;
   plan->sharedBytes = resources.sharedBytes;
@@ -405,6 +414,24 @@ void launchNativeW4A8(const std::shared_ptr<KernelPlan>& plan, const void* input
           source, detail::at<uint8_t>(params.local, params.symmetric.quantizedInput),
           detail::at<uint8_t>(params.local, params.symmetric.quantizedInputScale), tokens, params.config.hidden);
     }
+    MSCCLPP_CUDATHROW(cudaGetLastError());
+  }
+  if (params.net.nNet) {
+    // Every launch sends each network owner a message, even when empty; owners count them per launch.
+    const auto& c = params.config;
+    const bool staticFp8 = c.activationDtype == ActivationDtype::Fp8Static;
+    detail::NetSendArguments arguments{c.rank,
+                                       c.maxTokens,
+                                       c.topK,
+                                       c.numExperts / c.worldSize,
+                                       c.hidden,
+                                       staticFp8 ? 0 : detail::w4SourceScaleStride(c.hidden),
+                                       tokens,
+                                       ids ? ids : detail::at<int32_t>(params.local, params.symmetric.topkIds),
+                                       scores ? scores : detail::at<float>(params.local, params.symmetric.topkWeights),
+                                       detail::at<uint8_t>(params.local, params.symmetric.quantizedInput),
+                                       detail::at<uint8_t>(params.local, params.symmetric.quantizedInputScale)};
+    detail::netSendKernel<<<params.net.nNet, detail::NetSendThreads, 0, stream>>>(params.net, arguments);
     MSCCLPP_CUDATHROW(cudaGetLastError());
   }
   std::array<cudaLaunchAttribute, 2> launchAttributes{};

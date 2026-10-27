@@ -197,11 +197,22 @@ __device__ __forceinline__ void dispatchW4A8Tokens(const P& p, Storage& s, int l
     hasRow = hasRow && route.rank >= 0;
     // Local input quantization precedes this kernel; remote inputs are ordered by
     // the source's current-epoch route packets consumed in prepareRoutes.
-    auto* source =
-        hasRow ? peerAt<uint8_t>(p, route.rank, p.symmetric.quantizedInput) + size_t(route.token) * hidden : nullptr;
-    auto* sourceScale = hasRow ? peerAt<uint8_t>(p, route.rank, p.symmetric.quantizedInputScale) +
-                                     size_t(route.token) * w4SourceScaleStride(hidden)
-                               : nullptr;
+    const uint8_t* source = nullptr;
+    const uint8_t* sourceScale = nullptr;
+    float netWeight = 0.0f;
+    const bool netRow = hasRow && p.net.isNet(route.rank);
+    if (netRow) {
+      // Network sources' rows and weights arrived before routing relayed their routes.
+      NetEntry entry = netRouteEntry(p.net, route.rank, route.token, route.slot, p.config.topK,
+                                     size_t(p.config.maxTokens) * p.config.topK);
+      source = netRecvRow(p.net, route.rank, entry.row, p.config.maxTokens);
+      sourceScale = source + hidden;
+      netWeight = entry.weight;
+    } else if (hasRow) {
+      source = peerAt<uint8_t>(p, route.rank, p.symmetric.quantizedInput) + size_t(route.token) * hidden;
+      sourceScale = peerAt<uint8_t>(p, route.rank, p.symmetric.quantizedInputScale) +
+                    size_t(route.token) * w4SourceScaleStride(hidden);
+    }
     auto* destination = hasRow ? w.quantizedInput + size_t(w4StorageRow<typename P::Tiles>(row)) * hidden : nullptr;
     auto load = [&](int chunk) {
       int stage = chunk % DispatchStages;
@@ -223,7 +234,7 @@ __device__ __forceinline__ void dispatchW4A8Tokens(const P& p, Storage& s, int l
 #pragma unroll
       for (int stage = 0; stage < DispatchStages; ++stage)
         if (stage < chunks) load(stage);
-      routeWeight = loadRouteWeight(p, route);
+      routeWeight = netRow ? netWeight : loadRouteWeight(p, route);
     }
     auto process = [&](int chunk) {
       int stage = chunk % DispatchStages;

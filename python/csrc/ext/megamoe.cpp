@@ -71,7 +71,8 @@ void register_megamoe(nb::module_& m) {
       .def_rw("sm_margin", &NativeConfig::smMargin)
       .def_rw("gate_up_clamp", &NativeConfig::gateUpClamp)
       .def_rw("activation_dtype", &NativeConfig::activationDtype)
-      .def_rw("activation_scale", &NativeConfig::activationScale);
+      .def_rw("activation_scale", &NativeConfig::activationScale)
+      .def_rw("ranks_per_rack", &NativeConfig::ranksPerRack);
   nb::class_<MegaMoeContext>(m, "CppMegaMoeContext")
       .def_static(
           "create",
@@ -93,6 +94,8 @@ void register_megamoe(nb::module_& m) {
       .def_prop_ro("shared_bytes", &MegaMoeContext::sharedBytes)
       .def_prop_ro("symmetric_bytes", &MegaMoeContext::symmetricBytes)
       .def_prop_ro("private_bytes", &MegaMoeContext::privateBytes)
+      .def_prop_ro("network_bytes", &MegaMoeContext::networkBytes)
+      .def_prop_ro("ranks_per_rack", &MegaMoeContext::ranksPerRack)
       .def_prop_ro("kernel_id", &MegaMoeContext::kernelId)
       .def_prop_ro("kernel_tile_m", &MegaMoeContext::kernelTileM)
       .def_prop_ro("kernel_cluster_size", &MegaMoeContext::kernelClusterSize)

@@ -17,6 +17,7 @@
 
 #include "megamoe_collective.cuh"
 #include "megamoe_kernel.hpp"
+#include "megamoe_net.cuh"
 
 #if defined(__CUDA_ARCH__) && (!defined(__CUDA_ARCH_FAMILY_SPECIFIC__) || __CUDA_ARCH_FAMILY_SPECIFIC__ != 1000)
 #error "Native MegaMoE requires an SM100-family compilation target"
@@ -135,6 +136,7 @@ struct KernelParameters {
   Resource<cutlass::FastDivmod> fc2TaskDivisor;
   Resource<typename Types::Mainloop::Params> fc1;
   Resource<typename Types::Mainloop::Params> fc2;
+  Resource<NetDevice> net;
 };
 
 using W4A8Parameters = KernelParameters<W4A8CollectiveTypes>;
@@ -142,7 +144,8 @@ using W4A8Parameters = KernelParameters<W4A8CollectiveTypes>;
 template <ActivationDtype ActDtype = ActivationDtype::Mxfp8, class P>
 __device__ __forceinline__ auto w4a8ParameterView(const P& p, NativeConfig config) {
   using View = KernelParameters<typename P::Collective, true, ActDtype>;
-  return View{config, p.symmetric, p.workspace, p.local, p.peers, p.fc1TaskDivisor, p.fc2TaskDivisor, p.fc1, p.fc2};
+  return View{config,           p.symmetric,      p.workspace, p.local, p.peers,
+              p.fc1TaskDivisor, p.fc2TaskDivisor, p.fc1,       p.fc2,   p.net};
 }
 
 using W4A8KernelEntry = void (*)(W4A8Parameters, int, __bfloat16*, uint32_t*, const int32_t*, const float*);

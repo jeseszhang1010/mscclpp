@@ -152,12 +152,21 @@ __global__ __launch_bounds__(W4Threads, 1) void megaMoeW4A8(__grid_constant__ co
   }
   traceKernel(KernelTracePhase::OutputJoin, true);
   syncResidentGrid(&p.workspace.control->residentGridSyncState, gridDim.x);
+  if (p.net.nNet) {
+    // Every FC2 store has completed: return network sources' rows, then collect this rank's rows from network owners.
+    const uint64_t epoch = p.workspace.control->epoch;
+    if (blockIdx.x == 0) {
+      for (int index = threadIdx.x; index < p.net.nNet; index += blockDim.x) netReturnResults(p.net, index, epoch);
+    }
+    netCollectResults(p.net, at<uint8_t>(p.local, p.symmetric.partialOutput), tokens * p.config.topK, epoch);
+    syncResidentGrid(&p.workspace.control->residentGridSyncState, gridDim.x);
+  }
   if (blockIdx.x > 0 && !hasCombineWork<Hidden>(p, tokens)) {
     traceKernel(KernelTracePhase::OutputJoin, false);
     return;
   }
   if (blockIdx.x == 0 && threadIdx.x == 0) *at<uint64_t>(p.local, p.symmetric.epoch) = p.workspace.control->epoch;
-  if (threadIdx.x < p.config.worldSize) {
+  if (threadIdx.x < p.config.worldSize && !p.net.isNet(threadIdx.x)) {
     // Only CTA0 consumes the peer notification; followers observe the same epoch.
     if (blockIdx.x == 0)
       signalAndWait(p, threadIdx.x);

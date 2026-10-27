@@ -245,16 +245,31 @@ MSCCLPP_DEVICE_INLINE void storeOutputChunk(const KernelParams& params, const Ta
   int token = warp + lane * EpilogueWarps;
   if (lane < WarpTokens && token < validRows) {
     Route route = params.workspace.routes[task.block * KernelTileN + tokenOffset + token];
+    // Rows of network sources are staged locally and returned after FC2 (megamoe_net.hpp).
+    uint8_t* netRow = params.net.isNet(route.rank)
+                          ? netCombineRow(params.net, route.rank, route.token, route.slot, params.config.topK,
+                                          size_t(params.config.maxTokens) * params.config.topK)
+                          : nullptr;
     if constexpr (KernelParams::Activation == ActivationDtype::Fp8Static) {
-      auto* output = peerAt<uint8_t>(params, route.rank, params.symmetric.partialOutput);
-      size_t offset = (size_t(route.token) * params.config.topK + route.slot) * params.config.hidden + feature;
+      uint8_t* output;
+      size_t offset;
+      if (netRow) {
+        output = netRow;
+        offset = feature;
+      } else {
+        output = peerAt<uint8_t>(params, route.rank, params.symmetric.partialOutput);
+        offset = (size_t(route.token) * params.config.topK + route.slot) * params.config.hidden + feature;
+      }
       bulkStore(output + offset, s.epilogue.packedFp8 + token * PackedFp8RowStride, CtaTileM * sizeof(uint8_t));
       bulkStoreCommit();
       return;
     }
     __bfloat16* output;
     size_t offset;
-    if (params.config.worldSize == 1 && params.config.topK == 1) {
+    if (netRow) {
+      output = reinterpret_cast<__bfloat16*>(netRow);
+      offset = feature;
+    } else if (params.config.worldSize == 1 && params.config.topK == 1) {
       // Delivered also finalizes a unique local contribution by TMA store; BF16 TMA reduction is only needed
       // when another contribution targets the same token.
       output = params.finalOutput;
