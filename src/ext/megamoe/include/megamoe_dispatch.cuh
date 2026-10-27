@@ -200,12 +200,24 @@ __device__ __forceinline__ void dispatchTokens(const P& p, Storage& s, int local
     // Local input staging/quantization precedes this kernel; remote inputs are ordered by
     // the source's current-epoch route packets consumed in prepareRoutes.
     constexpr bool IsBf16 = P::Activation == ActivationDtype::Bf16;
-    auto* source = hasRow ? peerAt<uint8_t>(p, route.rank, IsBf16 ? p.symmetric.input : p.symmetric.quantizedInput) +
-                                size_t(route.token) * rowBytes
-                          : nullptr;
-    auto* sourceScale = (!IsBf16 && hasRow) ? peerAt<uint8_t>(p, route.rank, p.symmetric.quantizedInputScale) +
-                                                  size_t(route.token) * w4SourceScaleStride(hidden)
-                                            : nullptr;
+    const uint8_t* source = nullptr;
+    const uint8_t* sourceScale = nullptr;
+    float netWeight = 0.0f;
+    const bool netRow = hasRow && p.net.isNet(route.rank);
+    if (netRow) {
+      // Network sources' rows and weights arrived before routing relayed their routes.
+      NetEntry entry = netRouteEntry(p.net, route.rank, route.token, route.slot, p.config.topK,
+                                     size_t(p.config.maxTokens) * p.config.topK);
+      source = netRecvRow(p.net, route.rank, entry.row, p.config.maxTokens);
+      sourceScale = source + hidden;
+      netWeight = entry.weight;
+    } else if (hasRow) {
+      source = peerAt<uint8_t>(p, route.rank, IsBf16 ? p.symmetric.input : p.symmetric.quantizedInput) +
+               size_t(route.token) * rowBytes;
+      if constexpr (!IsBf16)
+        sourceScale = peerAt<uint8_t>(p, route.rank, p.symmetric.quantizedInputScale) +
+                      size_t(route.token) * w4SourceScaleStride(hidden);
+    }
     auto* destination = hasRow ? w.quantizedInput + size_t(w4StorageRow<typename P::Tiles>(row)) * rowBytes : nullptr;
     auto load = [&](int chunk) {
       int stage = chunk % DispatchStages;
@@ -227,7 +239,7 @@ __device__ __forceinline__ void dispatchTokens(const P& p, Storage& s, int local
 #pragma unroll
       for (int stage = 0; stage < DispatchStages; ++stage)
         if (stage < chunks) load(stage);
-      if (!p.config.combineRouteWeights) routeWeight = loadRouteWeight(p, route);
+      if (!p.config.combineRouteWeights) routeWeight = netRow ? netWeight : loadRouteWeight(p, route);
     }
     auto process = [&](int chunk) {
       int stage = chunk % DispatchStages;
