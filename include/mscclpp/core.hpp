@@ -395,8 +395,9 @@ struct EndpointConfig {
       HostNoAtomic,  // Use the host stack with write-with-immediate signaling (no RDMA atomics).
       GpuNetIo       // GPU-initiated RDMA via DOCA GPUNetIO. Requires a GPU endpoint, RDMA atomics and a library
                      // built with MSCCLPP_USE_GPUNETIO. PortChannel device operations post work requests directly
-                     // from the GPU using exclusive QPs and BlueFlame. Callers must serialize all operations on
-                     // a QP. Requires Hopper or newer; host-side Connection operations are not supported.
+                     // from the GPU using exclusive QPs and BlueFlame by default (see MSCCLPP_GPUNETIO_OPT and
+                     // MSCCLPP_GPUNETIO_BLUEFLAME). Callers must serialize all operations on a QP. BlueFlame requires
+                     // Hopper or newer; host-side Connection operations are not supported.
                      // Only `port` and `gidIndex` are used from this configuration.
     };
 

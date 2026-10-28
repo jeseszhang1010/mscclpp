@@ -25,8 +25,9 @@ path; the fetched tree itself is not modified. The GPUNetIO license is installed
 
 ## Requirements
 
-- A Hopper or newer NVIDIA GPU and an RDMA NIC with a BlueFlame UAR
-  (`DOCA_GPUNETIO_VERBS_NIC_HANDLER_GPU_SM_BF`). Device code must target `sm_90` or newer.
+- An RDMA NIC with GPU-initiated verbs support. With BlueFlame submission (the default), a Hopper or newer NVIDIA GPU
+  and a NIC with a BlueFlame UAR (`DOCA_GPUNETIO_VERBS_NIC_HANDLER_GPU_SM_BF`) are required, and device code must
+  target `sm_90` or newer.
 - RDMA atomics on both sides for `accumulate`; a GPUNetIO endpoint cannot connect to an endpoint in `HostNoAtomic`
   mode.
 - The local endpoint must be on a GPU (`EndpointConfig::device.type == DeviceType::GPU`).
@@ -70,17 +71,32 @@ every submission. Keep non-inline source buffers unchanged until their transfers
 
 ### Exclusively accessed queue pairs
 
-GPUNetIO always uses exclusive QPs. Callers must serialize **all** GPU operations on each connection, including
+By default, GPUNetIO uses exclusive QPs. Callers must serialize **all** GPU operations on each connection, including
 `flush` and channels sharing that connection. A different thread may take over after a barrier or release/acquire
 handoff; the caller need not be thread zero. Different QPs can be used concurrently.
 
 All requests, including strong-ordered inline semaphore signals (`DOCA_GPUNETIO_IB_MLX5_WQE_CTRL_STRONG_ORDERING`),
 atomics and non-inline transfers, are submitted through BlueFlame.
 GPU-resident recovery WQEs are retained. BF submission uses 8 KiB of per-block shared-memory WQE scratch (64 pairs of
-WQE slots) and waits for async source consumption before reusing a slot. Thread zero and blocks with up to 64 threads
-have dedicated slot pairs; additional threads in larger blocks serialize access to their hashed slot pair using an
-internal workspace lock, so different QPs cannot overwrite each other's WQEs.
-There is no regular-doorbell-only or CPU-proxy fallback.
+WQE slots), shared by all GPUNetIO operations of a kernel, and waits for async source consumption before reusing a
+slot. Thread zero and blocks with up to 64 threads have dedicated slot pairs; additional threads in larger blocks
+serialize access to their hashed slot pair using an internal workspace lock, so different QPs cannot overwrite each
+other's WQEs. There is no CPU-proxy fallback.
+
+### Submission knobs
+
+Two environment variables, read when a GPUNetIO queue pair is created, select the submission path. Both default to
+`1`.
+
+| Variable | `1` | `0` |
+|---|---|---|
+| `MSCCLPP_GPUNETIO_BLUEFLAME` | BlueFlame submission of WQEs prepared in shared memory (Hopper or newer) | Regular GPU-rung doorbells; WQEs are written to the GPU-resident SQ |
+| `MSCCLPP_GPUNETIO_OPT` | Exclusive QPs, strong-ordered inline token signals, inline payloads up to 28 bytes, single-WQE atomics, no per-operation system fences | DOCA's shared (`GPU`) QP mode, RDMA atomic +1 signals (a NOP followed by the atomic), and `__threadfence_system()` before each operation |
+
+With both set to `0`, the device code matches the initial GPUNetIO backend. With `MSCCLPP_GPUNETIO_OPT=0`, operations
+from concurrent threads on the same QP are allowed, BlueFlame payloads and signals are submitted together rather than
+overlapped, and WQEs of threads without a dedicated shared-memory slot pair are built in the SQ and read back for
+BlueFlame submission.
 
 ## Using the device API from another project
 

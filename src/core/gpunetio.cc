@@ -6,6 +6,7 @@
 #include <endian.h>
 
 #include <cstring>
+#include <mscclpp/env.hpp>
 #include <mscclpp/gpu_utils.hpp>
 #include <mutex>
 #include <string>
@@ -103,6 +104,7 @@ struct GpuNetIoQp::Impl {
   int gpuId;
   int port;
   int gidIndex;
+  uint32_t features = 0;
   IbQpInfo info;
 };
 
@@ -141,12 +143,18 @@ GpuNetIoQp::GpuNetIoQp(IbCtx* ibCtx, std::shared_ptr<GpuNetIoContext>& sharedCon
   attr.net_dev = pimpl_->dev;
   attr.ibpd = ibCtx->getPd();
   attr.sq_nwqe = 1024;
-  attr.nic_handler = DOCA_GPUNETIO_VERBS_NIC_HANDLER_GPU_SM_BF;
-  int major;
-  MSCCLPP_CUDATHROW(cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, gpuId));
-  if (major < 9) {
-    THROW(NET, Error, ErrorCode::InvalidUsage, "IB GpuNetIo mode requires Hopper or newer for BlueFlame submission");
+  const bool blueFlame = env()->gpuNetIoBlueFlame;
+  pimpl_->features = (blueFlame ? GpuNetIoFeatureBlueFlame : 0u) | (env()->gpuNetIoOpt ? GpuNetIoFeatureOpt : 0u);
+  attr.nic_handler = blueFlame ? DOCA_GPUNETIO_VERBS_NIC_HANDLER_GPU_SM_BF : DOCA_GPUNETIO_VERBS_NIC_HANDLER_GPU_SM_DB;
+  if (blueFlame) {
+    int major;
+    MSCCLPP_CUDATHROW(cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, gpuId));
+    if (major < 9) {
+      THROW(NET, Error, ErrorCode::InvalidUsage,
+            "IB GpuNetIo mode requires Hopper or newer for BlueFlame submission (set MSCCLPP_GPUNETIO_BLUEFLAME=0)");
+    }
   }
+  INFO(NET, "GPUNetIO QP on GPU ", gpuId, ": BlueFlame=", blueFlame, ", optimizations=", env()->gpuNetIoOpt);
   attr.mreg_type = DOCA_GPUNETIO_VERBS_MEM_REG_TYPE_DEFAULT;
   attr.send_dbr_mode_ext = DOCA_GPUNETIO_VERBS_SEND_DBR_MODE_EXT_VALID_DBR;
   attr.cq_type = DOCA_GPUNETIO_VERBS_CQ_64B;
@@ -179,6 +187,8 @@ GpuNetIoQp::~GpuNetIoQp() {
 const IbQpInfo& GpuNetIoQp::info() const { return pimpl_->info; }
 
 void* GpuNetIoQp::deviceQp() const { return pimpl_->deviceQp; }
+
+uint32_t GpuNetIoQp::features() const { return pimpl_->features; }
 
 void GpuNetIoQp::connect(const IbQpInfo& remote) {
   const auto& local = pimpl_->info;
@@ -265,6 +275,8 @@ GpuNetIoQp::~GpuNetIoQp() = default;
 const IbQpInfo& GpuNetIoQp::info() const { return pimpl_->info; }
 
 void* GpuNetIoQp::deviceQp() const { return nullptr; }
+
+uint32_t GpuNetIoQp::features() const { return 0; }
 
 void GpuNetIoQp::connect(const IbQpInfo&) {}
 
@@ -356,6 +368,7 @@ GpuNetIoDeviceHandle GpuNetIoConnection::deviceHandle(const RegisteredMemory& si
   handle.atomicScratchAddr = scratchInfo.ibMrInfo.addr;
   handle.outboundToken = outboundToken.get();
   handle.numMemories = static_cast<uint32_t>(table.size());
+  handle.features = qp_->features();
   return handle;
 }
 

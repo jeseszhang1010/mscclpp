@@ -38,6 +38,9 @@ class GpuNetIoQp {
   /// The GPU-resident QP (`doca_gpu_dev_verbs_qp*`) used by device code.
   void* deviceQp() const;
 
+  /// GpuNetIoFeature flags selected when the QP was created.
+  uint32_t features() const;
+
  private:
   struct Impl;
   std::unique_ptr<Impl> pimpl_;

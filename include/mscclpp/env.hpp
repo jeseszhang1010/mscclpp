@@ -120,6 +120,16 @@ class Env {
   /// Default is 0. Used when `EndpointConfig::Ib::gidIndex` is -1 (unspecified).
   const int ibGidIndex;
 
+  /// Env name: `MSCCLPP_GPUNETIO_BLUEFLAME`. If true, GPUNetIO queue pairs submit work requests through BlueFlame
+  /// from shared memory; if false, they use regular GPU-rung doorbells. Requires Hopper or newer when true.
+  /// Default is true.
+  const bool gpuNetIoBlueFlame;
+
+  /// Env name: `MSCCLPP_GPUNETIO_OPT`. If true, GPUNetIO uses exclusive queue pairs, strong-ordered inline semaphore
+  /// writes, inline small payloads, direct atomic work requests, and no per-operation system fences. If false, it
+  /// uses DOCA's shared queue-pair mode, RDMA-atomic signals, and per-operation system fences. Default is true.
+  const bool gpuNetIoOpt;
+
  private:
   Env();
 
