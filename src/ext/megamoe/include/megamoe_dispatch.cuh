@@ -205,7 +205,7 @@ __device__ __forceinline__ void dispatchTokens(const P& p, Storage& s, int local
     float netWeight = 0.0f;
     const bool netRow = hasRow && p.net.isNet(route.rank);
     if (netRow) {
-      // Network sources' rows and weights arrived before routing relayed their routes.
+      // Network sources' entries and rows arrived before routing completed.
       NetEntry entry = netRouteEntry(p.net, route.rank, route.token, route.slot, p.config.topK,
                                      size_t(p.config.maxTokens) * p.config.topK);
       source = netRecvRow(p.net, route.rank, entry.row, p.config.maxTokens);
