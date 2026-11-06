@@ -202,15 +202,11 @@ __device__ __forceinline__ void dispatchTokens(const P& p, Storage& s, int local
     constexpr bool IsBf16 = P::Activation == ActivationDtype::Bf16;
     const uint8_t* source = nullptr;
     const uint8_t* sourceScale = nullptr;
-    float netWeight = 0.0f;
-    const bool netRow = hasRow && p.net.isNet(route.rank);
-    if (netRow) {
-      // Network sources' entries and rows arrived before routing completed.
-      NetEntry entry = netRouteEntry(p.net, route.rank, route.token, route.slot, p.config.topK,
-                                     size_t(p.config.maxTokens) * p.config.topK);
-      source = netRecvRow(p.net, route.rank, entry.row, p.config.maxTokens);
+    const bool fromNet = hasRow && p.net.isNet(route.rank);
+    if (fromNet) {
+      // A network source's row sits in its forwarder's recvRows; lane 0 waits for it before loading.
+      source = netRow(p.net, route.rank, route.token);
       sourceScale = source + hidden;
-      netWeight = entry.weight;
     } else if (hasRow) {
       source = peerAt<uint8_t>(p, route.rank, IsBf16 ? p.symmetric.input : p.symmetric.quantizedInput) +
                size_t(route.token) * rowBytes;
@@ -235,11 +231,18 @@ __device__ __forceinline__ void dispatchTokens(const P& p, Storage& s, int local
     };
     float routeWeight = 1.0f;
     if (lane == 0 && hasRow) {
+      const uint64_t epoch = p.workspace.control->epoch;
+      if (fromNet) netWaitRows(p.net, route.rank, epoch);
       bulkFence();
 #pragma unroll
       for (int stage = 0; stage < DispatchStages; ++stage)
         if (stage < chunks) load(stage);
-      if (!p.config.combineRouteWeights) routeWeight = netRow ? netWeight : loadRouteWeight(p, route);
+      // Owners weight network sources' rows even with combineRouteWeights: racks return weighted sums.
+      if (fromNet)
+        routeWeight = netRouteWeight(p.net, route.rank, route.token * p.config.topK + route.slot,
+                                     p.config.maxTokens * p.config.topK, epoch);
+      else if (!p.config.combineRouteWeights)
+        routeWeight = loadRouteWeight(p, route);
     }
     auto process = [&](int chunk) {
       int stage = chunk % DispatchStages;
@@ -250,7 +253,8 @@ __device__ __forceinline__ void dispatchTokens(const P& p, Storage& s, int local
                                                           [&] { load(chunk + DispatchStages); });
       if (lane == 0) {
         auto* counter = w4InputChunkCounter<Types>(w, hidden, tile, chunk);
-        if (hasRow && chunk == chunks - 1 && !p.config.combineRouteWeights) w.routes[row].weight = routeWeight;
+        if (hasRow && chunk == chunks - 1 && (!p.config.combineRouteWeights || p.net.nNet))
+          w.routes[row].weight = routeWeight;
         publicationPhase ^= 1u;
         publishDispatchChunk<Types>(s.dispatch, localWarp, counter, hasRow, publicationPhase);
       }

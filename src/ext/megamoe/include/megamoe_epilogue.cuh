@@ -218,7 +218,9 @@ MSCCLPP_DEVICE_INLINE float2 fc2RouteWeights(const KernelParams& params, const T
                        firstToken + token + 1 < validRows && ids[row + 1] == 0 ? 1.0f : 0.0f);
   }
   if constexpr (KernelParams::Activation == ActivationDtype::Bf16) return make_float2(1.0f, 1.0f);
-  if (params.config.combineRouteWeights) return make_float2(1.0f, 1.0f);
+  // With an inter-rack path, dispatch stores 1 for rows combined with their weights and the router weight for rows of
+  // network sources, which are summed per rack before the source combines them.
+  if (params.config.combineRouteWeights && !params.net.nNet) return make_float2(1.0f, 1.0f);
   const Route* routes = params.workspace.routes + row;
   return make_float2(routes[0].weight, routes[1].weight);
 }
@@ -314,32 +316,25 @@ MSCCLPP_DEVICE_INLINE void storeOutputChunk(const KernelParams& params, const Ta
   int token = warp + lane * EpilogueWarps;
   if (lane < WarpTokens && token < validRows) {
     Route route = params.workspace.routes[task.block * KernelTileN + tokenOffset + token];
-    // Rows of network sources are staged locally and returned after FC2 (megamoe_net.hpp).
-    uint8_t* netRow = params.net.isNet(route.rank)
-                          ? netCombineRow(params.net, route.rank, route.token, route.slot, params.config.topK,
-                                          size_t(params.config.maxTokens) * params.config.topK)
-                          : nullptr;
     if constexpr (KernelParams::Activation == ActivationDtype::Fp8Static) {
-      uint8_t* output;
-      size_t offset;
-      if (netRow) {
-        output = netRow;
-        offset = feature;
-      } else {
-        output = peerAt<uint8_t>(params, route.rank, params.symmetric.partialOutput);
-        offset = (size_t(route.token) * params.config.topK + route.slot) * params.config.hidden + feature;
-      }
+      auto* output = peerAt<uint8_t>(params, route.rank, params.symmetric.partialOutput);
+      size_t offset = (size_t(route.token) * params.config.topK + route.slot) * params.config.hidden + feature;
       bulkStore(output + offset, s.epilogue.packedFp8 + token * PackedFp8RowStride, CtaTileM * sizeof(uint8_t));
+      bulkStoreCommit();
+      return;
+    }
+    if (params.net.isNet(route.rank)) {
+      // Network sources' rows are summed per token in their forwarder's accum row (megamoe_net.hpp).
+      bulkReduceStore<__nv_bfloat16>(
+          netAccumRow(params.net, route.rank, route.token, params.workspace.control->epoch) + feature,
+          s.epilogue.packed + token * PackedRowStride, CtaTileM * sizeof(__bfloat16));
       bulkStoreCommit();
       return;
     }
     __bfloat16* output;
     size_t offset;
-    if (netRow) {
-      output = reinterpret_cast<__bfloat16*>(netRow);
-      offset = feature;
-    } else if (!params.config.combineRouteWeights && KernelParams::WeightMxfp4 && params.config.worldSize == 1 &&
-               params.config.topK == 1) {
+    if (!params.config.combineRouteWeights && KernelParams::WeightMxfp4 && params.config.worldSize == 1 &&
+        params.config.topK == 1) {
       // Delivered also finalizes a unique local contribution by TMA store; BF16 TMA reduction is only needed
       // when another contribution targets the same token.
       output = finalOutput;
@@ -478,6 +473,7 @@ MSCCLPP_DEVICE_INLINE void combineSlots(const KernelParams& params, int tokens, 
   static_assert((Hidden == 0 || Hidden % Elements == 0) && CombineLoads % Slots == 0 && Slots <= CombineSlots);
   const int topK = params.config.topK;
   const bool combineRouteWeights = params.config.combineRouteWeights;
+  const int localExperts = params.config.numExperts / params.config.worldSize;
   auto partial = reinterpret_cast<const uint4*>(at<__bfloat16>(params.local, params.symmetric.partialOutput));
   auto partialFp8 = reinterpret_cast<const uint2*>(at<uint8_t>(params.local, params.symmetric.partialOutput));
   constexpr bool StaticScale = KernelParams::Activation == ActivationDtype::Fp8Static;
@@ -513,10 +509,13 @@ MSCCLPP_DEVICE_INLINE void combineSlots(const KernelParams& params, int tokens, 
     for (int base = 0; base < (ProcessMultipleSlotBatches ? topK : 1); base += Slots) {
       bool routed[Slots];
 #pragma unroll
-      for (int slot = 0; slot < Slots; ++slot)
-        routed[slot] = !ProcessMultipleSlotBatches || base == 0
-                           ? taskIds[slot] >= 0
-                           : base + slot < topK && routeIds[token * topK + base + slot] >= 0;
+      for (int slot = 0; slot < Slots; ++slot) {
+        const int id = !ProcessMultipleSlotBatches || base == 0
+                           ? taskIds[slot]
+                           : (base + slot < topK ? routeIds[token * topK + base + slot] : -1);
+        // Routes owned in another rack come back summed per rack below.
+        routed[slot] = id >= 0 && !(params.net.nNet && params.net.isNet(id / localExperts));
+      }
       if constexpr (StaticScale) {
         const uint2* sourceFp8 = partialFp8 + size_t(token * topK + base) * vectors + first;
         uint2 rawValues[Slots][Items];
@@ -575,6 +574,24 @@ MSCCLPP_DEVICE_INLINE void combineSlots(const KernelParams& params, int tokens, 
         }
       }
     }
+    if constexpr (!StaticScale) {
+      for (int index = 0; index < params.net.nNet; ++index) {
+        const uint4* rack = netCombineIn(params.net, index, token) + first;
+        mscclpp::bf16x8 values[Items];
+#pragma unroll
+        for (int item = 0; item < Items; ++item) {
+          values[item].storage = make_uint4(0, 0, 0, 0);
+          if ((Hidden > 0 && (Hidden / Elements) % TaskVectors == 0) || first + item * WarpSize < vectors)
+            values[item].storage = __ldcg(rack + item * WarpSize);
+        }
+#pragma unroll
+        for (int item = 0; item < Items; ++item) {
+          auto partialValues = mscclpp::to<mscclpp::f32x8>(values[item]);
+#pragma unroll
+          for (int element = 0; element < Elements; ++element) sums[item].data[element] += partialValues.data[element];
+        }
+      }
+    }
 #pragma unroll
     for (int item = 0; item < Items; ++item) {
       if constexpr (StaticScale) {
@@ -619,15 +636,7 @@ __device__ void finishAndCombine(const KernelParams& p, int tokens, __bfloat16* 
     if (!p.config.combineRouteWeights && p.config.worldSize == 1 && p.config.topK == 1) return;
   }
   traceKernel(KernelTracePhase::OutputJoin, true);
-  if (p.net.nNet && blockIdx.x == 0) netSnapshotHeaders(p.net, p.workspace.control->epoch);
   syncResidentGrid(&p.workspace.control->residentGridSyncState, gridDim.x);
-  if (p.net.nNet) {
-    // Every FC2 store has completed: return network sources' rows, then collect this rank's rows from network owners.
-    const uint64_t epoch = p.workspace.control->epoch;
-    netReturnResults(p.net);
-    netCollectResults(p.net, at<uint8_t>(p.local, p.symmetric.partialOutput), tokens * p.config.topK, epoch);
-    syncResidentGrid(&p.workspace.control->residentGridSyncState, gridDim.x);
-  }
   if (blockIdx.x > 0 && !hasCombineWork<Hidden>(p, tokens)) {
     traceKernel(KernelTracePhase::OutputJoin, false);
     return;
@@ -641,6 +650,8 @@ __device__ void finishAndCombine(const KernelParams& p, int tokens, __bfloat16* 
       waitAtLeast<uint64_t, scopeSystem>(at<uint64_t>(p.local, p.symmetric.peerSignals) + threadIdx.x,
                                          p.workspace.control->epoch);
   }
+  // Remote racks return one partial sum per token over their rail.
+  if (p.net.nNet) netWaitResults(p.net, p.workspace.control->epoch);
   __syncthreads();
   traceKernel(KernelTracePhase::OutputJoin, false);
   traceKernel(KernelTracePhase::Combine, true);
